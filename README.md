@@ -5,10 +5,11 @@ Fixed: 2026-06-11 · Ubuntu 24.04.4 · PipeWire 1.0.5 · WirePlumber 0.4.17
 **Everything below is packaged in [fix-audient-id14.sh](fix-audient-id14.sh):**
 
 ```bash
-./fix-audient-id14.sh           # apply the full fix + verify (idempotent)
-./fix-audient-id14.sh verify    # check only, change nothing
-./fix-audient-id14.sh revert    # remove the config, back to stock behavior
-sudo ./fix-audient-id14.sh system   # optional hardening (see below)
+./fix-audient-id14.sh                  # imbalance fix + verify (idempotent)
+./fix-audient-id14.sh apply --wineasio # also pin capture@512 for wineASIO/Rocksmith
+./fix-audient-id14.sh verify           # check only, change nothing
+./fix-audient-id14.sh revert           # remove the config, back to stock behavior
+sudo ./fix-audient-id14.sh system      # optional hardening (see below)
 ```
 
 The script auto-detects WirePlumber 0.4 (Lua) vs 0.5+ (conf.d) — safe to re-run
@@ -66,6 +67,36 @@ EOF
 
 Delete the two config files above and restart the stack:
 `systemctl --user restart pipewire pipewire-pulse wireplumber`
+
+## Rocksmith 2014 + wineASIO (low-latency guitar)
+
+Optional companion to the imbalance fix, for playing Rocksmith 2014 through the
+iD14 with low-latency ASIO input under Proton.
+
+- **`fix-audient-id14.sh apply --wineasio`** — the imbalance fix *plus* a rule
+  that pins the iD14 **capture** clock to quantum 512 (`node.force-quantum`).
+  Without it the capture defaults to its own 128-frame domain while wineASIO runs
+  at 512; the cross-domain resampler then feeds the game silence ("no input"),
+  then crackle. Adds ~11 ms capture latency, so plain `apply` leaves it off.
+- **`setup-rocksmith.sh`** — first-time setup *from scratch* (works on a fresh
+  clone, no bundle): installs PipeWire-JACK, downloads GE-Proton + RS_ASIO from
+  upstream, writes the helper scripts / `RS_ASIO.ini` / prefix `.reg` inline,
+  patches `Rocksmith.ini`, then calls `fix-audient-id14.sh apply --wineasio`.
+  wineASIO has no clean prebuilt download, so supply it via `WINEASIO_DEB=`
+  (KXStudio .deb), `WINEASIO_DIR=`, a system install, or a `./rocksmith/` bundle.
+- **`backup-rocksmith.sh`** — snapshots the Rocksmith/wineASIO layer (wineASIO
+  DLLs, RS_ASIO + the tuned `RS_ASIO.ini`/`Rocksmith.ini`, helper scripts, the
+  prefix `.reg`, launch options) into `./rocksmith/`. That folder is
+  `.gitignore`d (it holds copyrighted binaries) — each user regenerates it.
+- **`restore-rocksmith.sh`** — rebuilds after an OS reformat by replaying an
+  exact `./rocksmith/` snapshot (vs `setup`, which fetches current upstream),
+  then calls `fix-audient-id14.sh apply --wineasio`.
+
+All three auto-detect the Steam library (override `STEAM_LIBRARY=/path`).
+
+**Reboot-safe:** all of the above is WirePlumber config + on-disk files +
+Steam launch options that load automatically every boot — you never re-run
+anything per reboot; `restore-rocksmith.sh` is only for a fresh OS install.
 
 ## Note for WirePlumber 0.5+ (future Ubuntu upgrade)
 

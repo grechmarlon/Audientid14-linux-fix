@@ -20,21 +20,35 @@
 #      surround routes), restarts the stack, sets the stereo sink as default.
 #   5. Verifies: stereo profile active, balance 0.00, hw mixer untouched across
 #      a volume sweep.
+#   6. (opt-in: `apply --wineasio`) capture-latency rule for wineASIO/Rocksmith:
+#      pins the iD14 *capture* clock to quantum 512 (node.force-quantum) so it
+#      can't fall into its own intrinsic 128-frame driver domain. Without it,
+#      wineASIO (Rocksmith) runs at 512 while the capture sits at 128, and
+#      PipeWire's cross-domain resampler feeds the app silence (then crackle).
+#      Adds ~11 ms capture latency, so plain `apply` does NOT enable it (desktop
+#      audio stays low-latency) and actively removes it; the Rocksmith restore
+#      script runs `apply --wineasio` to turn it on.
 #
 # Usage:
-#   ./fix-audient-id14.sh           apply + verify
-#   ./fix-audient-id14.sh verify    verify only, change nothing
-#   ./fix-audient-id14.sh revert    remove the config and restart audio
-#   sudo ./fix-audient-id14.sh system   optional hardening (alsactl store,
-#                                       /etc profile-set copy, udev rule)
+#   ./fix-audient-id14.sh                  imbalance fix + verify (no Rocksmith)
+#   ./fix-audient-id14.sh apply --wineasio  imbalance fix + pin capture@512 for wineASIO
+#   ./fix-audient-id14.sh verify           verify only, change nothing
+#   ./fix-audient-id14.sh revert           remove all config and restart audio
+#   sudo ./fix-audient-id14.sh system      optional hardening (alsactl store,
+#                                          /etc profile-set copy, udev rule)
 set -euo pipefail
 
 CARD_GLOB='alsa_card.usb-Audient_Audient_iD14*'
+NODE_GLOB='alsa_input.usb-Audient_Audient_iD14*'
 PROFILE_SET=audient-id14.conf
 LUA_FILE="$HOME/.config/wireplumber/main.lua.d/51-audient-id14.lua"
 CONF_FILE="$HOME/.config/wireplumber/wireplumber.conf.d/51-audient-id14.conf"
+LAT_LUA_FILE="$HOME/.config/wireplumber/main.lua.d/52-audient-id14-capture-latency.lua"
+LAT_CONF_FILE="$HOME/.config/wireplumber/wireplumber.conf.d/52-audient-id14-capture-latency.conf"
 ACP_FILE="$HOME/.config/alsa-card-profile/mixer/profile-sets/$PROFILE_SET"
 STATE_DIR="$HOME/.local/state/wireplumber"
+CAPTURE_QUANTUM=512
+WINEASIO_RULE=0   # set to 1 by `apply --wineasio` (or the `wineasio` subcommand)
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m OK \033[0m %s\n' "$*"; }
@@ -84,6 +98,56 @@ table.insert(alsa_monitor.rules, {
   apply_properties = {
     ["api.alsa.soft-mixer"] = true,
     ["device.profile-set"] = "$PROFILE_SET",
+  },
+})
+EOF
+  fi
+}
+
+write_capture_latency_rule() {
+  # Pin the iD14 CAPTURE node to quantum $CAPTURE_QUANTUM so wineASIO (Rocksmith)
+  # shares its 512-frame clock domain instead of the capture's intrinsic 128 —
+  # the cross-domain mismatch otherwise feeds the app silence, then crackle.
+  if [ "$(wp_minor)" -ge 05 ] 2>/dev/null; then
+    info "WirePlumber 0.5+: writing $LAT_CONF_FILE"
+    mkdir -p "$(dirname "$LAT_CONF_FILE")"
+    cat > "$LAT_CONF_FILE" <<EOF
+# Audient iD14: pin the capture clock to quantum $CAPTURE_QUANTUM (matching
+# wineASIO/Rocksmith) so it doesn't run its own 128-frame domain. Adds ~11 ms
+# capture latency. Remove this file if you need lower-latency native capture.
+monitor.alsa.rules = [
+  {
+    matches = [
+      { node.name = "~$NODE_GLOB" }
+    ]
+    actions = {
+      update-props = {
+        node.force-quantum = $CAPTURE_QUANTUM
+        node.latency = "$CAPTURE_QUANTUM/48000"
+        api.alsa.headroom = 256
+      }
+    }
+  }
+]
+EOF
+    rm -f "$LAT_LUA_FILE"
+  else
+    info "WirePlumber 0.4: writing $LAT_LUA_FILE"
+    mkdir -p "$(dirname "$LAT_LUA_FILE")"
+    cat > "$LAT_LUA_FILE" <<EOF
+-- Audient iD14: pin the capture clock to quantum $CAPTURE_QUANTUM (matching
+-- wineASIO/Rocksmith) so it doesn't run its own intrinsic 128-frame driver
+-- domain. Without this the guitar link crosses a 128<->512 resampler bridge
+-- that feeds silence, then crackle. Adds ~11 ms capture latency; delete this
+-- file (+ restart wireplumber) for lower-latency native capture.
+table.insert(alsa_monitor.rules, {
+  matches = {
+    { { "node.name", "matches", "$NODE_GLOB" } },
+  },
+  apply_properties = {
+    ["node.force-quantum"] = $CAPTURE_QUANTUM,
+    ["node.latency"] = "$CAPTURE_QUANTUM/48000",
+    ["api.alsa.headroom"] = 256,
   },
 })
 EOF
@@ -210,6 +274,11 @@ apply() {
   local card
   card=$(find_card); [ -n "$card" ] || fail "iD14 not found in /proc/asound/cards — plug it in first"
   write_wireplumber_rule
+  if [ "$WINEASIO_RULE" = "1" ]; then
+    write_capture_latency_rule
+  else
+    rm -f "$LAT_LUA_FILE" "$LAT_CONF_FILE"   # plain desktop use: no extra capture latency
+  fi
   write_profile_set
   pin_hw_mixer "$card"
   clean_state
@@ -223,7 +292,7 @@ apply() {
 
 revert() {
   info "Removing iD14 config"
-  rm -f "$LUA_FILE" "$CONF_FILE" "$ACP_FILE"
+  rm -f "$LUA_FILE" "$CONF_FILE" "$LAT_LUA_FILE" "$LAT_CONF_FILE" "$ACP_FILE"
   restart_stack
   ok "reverted — the card is back to auto-generated profiles"
 }
@@ -249,9 +318,12 @@ EOF
 }
 
 case "${1:-apply}" in
-  apply)  apply ;;
+  apply)
+    if [ "${2:-}" = "--wineasio" ] || [ "${2:-}" = "--rocksmith" ]; then WINEASIO_RULE=1; fi
+    apply ;;
+  wineasio)  WINEASIO_RULE=1; apply ;;   # alias for: apply --wineasio
   verify) verify ;;
   revert) revert ;;
   system) system_harden ;;
-  *) echo "usage: $0 [apply|verify|revert|system]" >&2; exit 2 ;;
+  *) echo "usage: $0 [apply [--wineasio] | wineasio | verify | revert | system]" >&2; exit 2 ;;
 esac
